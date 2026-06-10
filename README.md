@@ -18,8 +18,10 @@ for a day of Vancouver-area traffic.
   IATA/ICAO code (large + medium airports worldwide, plus small fields with scheduled service).
 - **Callsign labels** — each aircraft's most recent position is labeled with its
   callsign (falling back to the hex ID if no callsign was broadcast).
-- **Controls** — checkboxes toggle the airport and callsign labels; the slider sets
-  vertical exaggeration of the altitude axis.
+- **Controls** — checkboxes toggle the airport and callsign labels; the **Terrain**
+  selector trades download size for terrain resolution (Low ≈ 12 tiles, Medium ≈ 30,
+  High ≈ 120 — each step admits roughly one extra zoom level and re-renders in place);
+  the slider sets vertical exaggeration of the altitude axis.
 
 ## Running
 

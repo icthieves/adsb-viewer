@@ -9,8 +9,13 @@ const TILE_URL = "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x
 const TILE_TIMEOUT_MS = 12000;         // abort a stalled tile request after this long
 const TILE_RETRIES = 2;                // extra attempts per tile before giving up
 const GAP_BREAK_MS = 10 * 60 * 1000;   // break trajectory lines across signal gaps
-const MAX_TILES = 30;                  // terrain download budget per render
-const GRID_TARGET_W = 250;             // terrain grid width after downsampling
+// Terrain detail presets: tile download budget and post-downsample grid width.
+// Each step up in budget admits roughly one extra zoom level (4x the tiles).
+const TERRAIN_DETAIL = {
+  low:    { maxTiles: 12,  gridW: 160 },
+  medium: { maxTiles: 30,  gridW: 250 },
+  high:   { maxTiles: 120, gridW: 500 },
+};
 const BBOX_MARGIN = 0.08;              // fraction of span added around trajectories
 const MIN_SPAN_DEG = 0.4;              // minimum bbox span so tiny datasets still get context
 const WATER_SENTINEL = -500;           // surfacecolor value for sea cells (wide colorscale band)
@@ -169,11 +174,11 @@ const pxToLat = (y, z) => {
   return Math.atan(Math.sinh(n)) * 180 / Math.PI;
 };
 
-function pickZoom(bbox) {
-  for (let z = 11; z >= 3; z--) {
+function pickZoom(bbox, maxTiles) {
+  for (let z = 12; z >= 3; z--) {
     const tx = Math.floor(lonToPx(bbox.lonMax, z) / 256) - Math.floor(lonToPx(bbox.lonMin, z) / 256) + 1;
     const ty = Math.floor(latToPx(bbox.latMin, z) / 256) - Math.floor(latToPx(bbox.latMax, z) / 256) + 1;
-    if (tx * ty <= MAX_TILES) return z;
+    if (tx * ty <= maxTiles) return z;
   }
   return 3;
 }
@@ -197,8 +202,8 @@ async function loadTile(z, x, y, attempt = 0) {
   }
 }
 
-async function fetchTerrain(bbox, onProgress) {
-  const z = pickZoom(bbox);
+async function fetchTerrain(bbox, detail, onProgress) {
+  const z = pickZoom(bbox, detail.maxTiles);
   const x0 = Math.floor(lonToPx(bbox.lonMin, z) / 256);
   const x1 = Math.floor(lonToPx(bbox.lonMax, z) / 256);
   const y0 = Math.floor(latToPx(bbox.latMax, z) / 256);
@@ -232,7 +237,7 @@ async function fetchTerrain(bbox, onProgress) {
   const w = pxR - pxL, h = pxB - pxT;
   const rgba = ctx.getImageData(pxL, pxT, w, h).data;
 
-  const step = Math.max(1, Math.round(w / GRID_TARGET_W));
+  const step = Math.max(1, Math.round(w / detail.gridW));
   const gw = Math.floor(w / step), gh = Math.floor(h / step);
   const zGrid = [], scGrid = [];
   for (let gy = 0; gy < gh; gy++) {
@@ -369,6 +374,9 @@ function dataBbox(aircraft) {
   };
 }
 
+let lastParsed = null;   // { aircraft, bad, sourceName } — detail changes re-render without re-parsing
+let renderSeq = 0;       // guards against a stale async render overwriting a newer one
+
 async function render(text, sourceName) {
   setStatus(`Processing ${sourceName}…`);
   setProgress(null);
@@ -376,17 +384,34 @@ async function render(text, sourceName) {
   await paint();
   try {
     const { aircraft, bad } = parseCSV(text);
+    lastParsed = { aircraft, bad, sourceName };
+  } catch (err) {
+    console.error(err);
+    setStatus(`Error: ${err.message}`, true);
+    return;
+  }
+  await renderScene({ keepCamera: false });
+}
+
+async function renderScene({ keepCamera }) {
+  const { aircraft, bad, sourceName } = lastParsed;
+  const seq = ++renderSeq;
+  const stale = () => seq !== renderSeq;
+  try {
     const { traces, last, total } = buildTrajectories(aircraft);
     const bbox = dataBbox(aircraft);
     setStatus(`Processed ${sourceName}: ${aircraft.size} aircraft, ${total.toLocaleString()} points — fetching terrain…`);
+    const detail = TERRAIN_DETAIL[$("terrain-detail").value] || TERRAIN_DETAIL.medium;
 
     const [terrainRes, airportsRes] = await Promise.allSettled([
-      fetchTerrain(bbox, (d, n) => {
+      fetchTerrain(bbox, detail, (d, n) => {
+        if (stale()) return;
         setStatus(`Fetching terrain tiles ${d}/${n}…`);
         setProgress(d / n);
       }),
       loadAirportsDb(),
     ]);
+    if (stale()) return;
     setProgress(null);
     const terrain = terrainRes.status === "fulfilled" ? terrainRes.value : null;
     const warnings = [];
@@ -434,7 +459,9 @@ async function render(text, sourceName) {
         xaxis: axis("Longitude", "#0d1117"),
         yaxis: axis("Latitude", "#0d1117"),
         zaxis: axis("Altitude (m)", "#161b22"),
-        camera: { eye: { x: 1.4, y: -1.6, z: 0.8 } },
+        camera: keepCamera && plotEl._fullLayout && plotEl._fullLayout.scene
+          ? JSON.parse(JSON.stringify(plotEl._fullLayout.scene.camera))
+          : { eye: { x: 1.4, y: -1.6, z: 0.8 } },
       },
     }, { responsive: true, displaylogo: false });
     applyToggles();
@@ -445,7 +472,7 @@ async function render(text, sourceName) {
       `${total.toLocaleString()} points`,
       [...days].sort().join(", ") + " UTC",
       `${airportCount} airports`,
-      terrain ? `terrain z${terrain.zoom}` : null,
+      terrain ? `terrain z${terrain.zoom} (${terrain.lons.length}×${terrain.lats.length})` : null,
       bad ? `${bad} rows skipped` : null,
       warnings.length ? `⚠ ${warnings.join(", ")}` : null,
     ].filter(Boolean);
@@ -522,6 +549,10 @@ $("sample-btn").addEventListener("click", async () => {
 
 $("cb-callsigns").addEventListener("change", applyToggles);
 $("cb-airports").addEventListener("change", applyToggles);
+
+$("terrain-detail").addEventListener("change", () => {
+  if (lastParsed) renderScene({ keepCamera: true });
+});
 
 $("vscale").addEventListener("input", () => {
   const v = parseFloat($("vscale").value);

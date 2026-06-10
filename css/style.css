@@ -83,6 +83,15 @@ body { display: flex; flex-direction: column; }
 }
 .toggle input[type="checkbox"] { accent-color: var(--accent); }
 
+.toggle select {
+  background: #21262d;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--fg);
+  font-size: 12px;
+  padding: 3px 6px;
+}
+
 #vscale-wrap input[type="range"] { width: 90px; accent-color: var(--accent); }
 #vscale-val { color: var(--fg); min-width: 28px; }
 

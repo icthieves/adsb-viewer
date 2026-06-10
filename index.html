@@ -22,6 +22,14 @@
     <button class="btn" id="sample-btn" type="button">Load sample</button>
     <label class="toggle"><input type="checkbox" id="cb-callsigns" checked> Callsigns</label>
     <label class="toggle"><input type="checkbox" id="cb-airports" checked> Airports</label>
+    <label class="toggle" title="Terrain resolution &mdash; higher fetches more elevation tiles">
+      Terrain
+      <select id="terrain-detail">
+        <option value="low">Low</option>
+        <option value="medium" selected>Medium</option>
+        <option value="high">High</option>
+      </select>
+    </label>
     <label class="toggle" id="vscale-wrap" title="Vertical exaggeration">
       Vertical &times;<span id="vscale-val">0.35</span>
       <input type="range" id="vscale" min="0.05" max="1" step="0.05" value="0.35">
