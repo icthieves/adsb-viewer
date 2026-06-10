@@ -6,6 +6,8 @@
 "use strict";
 
 const TILE_URL = "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png";
+const TILE_TIMEOUT_MS = 12000;         // abort a stalled tile request after this long
+const TILE_RETRIES = 2;                // extra attempts per tile before giving up
 const GAP_BREAK_MS = 10 * 60 * 1000;   // break trajectory lines across signal gaps
 const MAX_TILES = 30;                  // terrain download budget per render
 const GRID_TARGET_W = 250;             // terrain grid width after downsampling
@@ -30,6 +32,17 @@ function setStatus(msg, isError = false) {
   statusEl.textContent = msg;
   statusEl.classList.toggle("error", isError);
 }
+
+// frac in [0,1] shows the bar; null hides it
+function setProgress(frac) {
+  const bar = $("progress");
+  if (frac === null) { bar.classList.remove("active"); return; }
+  bar.classList.add("active");
+  $("progress-fill").style.width = `${Math.round(Math.min(frac, 1) * 100)}%`;
+}
+
+// Let the browser paint a status update before blocking the main thread
+const paint = () => new Promise(r => requestAnimationFrame(() => setTimeout(r, 0)));
 
 /* ---------------- CSV parsing ---------------- */
 
@@ -165,14 +178,23 @@ function pickZoom(bbox) {
   return 3;
 }
 
-function loadTile(z, x, y) {
-  return new Promise((resolve, reject) => {
-    const img = new Image();
-    img.crossOrigin = "anonymous";
-    img.onload = () => resolve(img);
-    img.onerror = () => reject(new Error(`tile ${z}/${x}/${y} failed`));
-    img.src = TILE_URL.replace("{z}", z).replace("{x}", x).replace("{y}", y);
-  });
+// fetch + AbortController so a stalled request can't hang the render forever
+// (an Image() src load has no timeout and may never fire onload OR onerror)
+async function loadTile(z, x, y, attempt = 0) {
+  const url = TILE_URL.replace("{z}", z).replace("{x}", x).replace("{y}", y);
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), TILE_TIMEOUT_MS);
+  try {
+    const resp = await fetch(url, { mode: "cors", signal: ctrl.signal });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    return await createImageBitmap(await resp.blob());
+  } catch (err) {
+    if (attempt < TILE_RETRIES) return loadTile(z, x, y, attempt + 1);
+    const why = err.name === "AbortError" ? "timed out" : err.message;
+    throw new Error(`tile ${z}/${x}/${y} ${why}`);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function fetchTerrain(bbox, onProgress) {
@@ -348,17 +370,24 @@ function dataBbox(aircraft) {
 }
 
 async function render(text, sourceName) {
-  setStatus(`Parsing ${sourceName}…`);
+  setStatus(`Processing ${sourceName}…`);
+  setProgress(null);
   $("empty-hint").style.display = "none";
+  await paint();
   try {
     const { aircraft, bad } = parseCSV(text);
     const { traces, last, total } = buildTrajectories(aircraft);
     const bbox = dataBbox(aircraft);
+    setStatus(`Processed ${sourceName}: ${aircraft.size} aircraft, ${total.toLocaleString()} points — fetching terrain…`);
 
     const [terrainRes, airportsRes] = await Promise.allSettled([
-      fetchTerrain(bbox, (d, n) => setStatus(`Fetching terrain tiles ${d}/${n}…`)),
+      fetchTerrain(bbox, (d, n) => {
+        setStatus(`Fetching terrain tiles ${d}/${n}…`);
+        setProgress(d / n);
+      }),
       loadAirportsDb(),
     ]);
+    setProgress(null);
     const terrain = terrainRes.status === "fulfilled" ? terrainRes.value : null;
     const warnings = [];
     if (!terrain) warnings.push("terrain unavailable");
@@ -385,6 +414,9 @@ async function render(text, sourceName) {
     const ay = kmY / kmX;
     zAspectMax = Math.max(1, ay);
     const vscale = parseFloat($("vscale").value);
+
+    setStatus("Rendering 3D scene…");
+    await paint();
 
     const axis = (title, bg) => ({
       title, color: "#8b949e", gridcolor: "#21262d",
@@ -420,6 +452,7 @@ async function render(text, sourceName) {
     setStatus(parts.join(" | "), warnings.length > 0);
   } catch (err) {
     console.error(err);
+    setProgress(null);
     setStatus(`Error: ${err.message}`, true);
   }
 }
@@ -449,13 +482,40 @@ $("file-input").addEventListener("change", e => {
   e.target.value = "";
 });
 
+// Streaming download so large files show byte progress. With gzip transfer the
+// Content-Length is the compressed size, so the fraction is clamped to 1.
+async function downloadWithProgress(url, label) {
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(`${url}: HTTP ${resp.status}`);
+  const total = +resp.headers.get("Content-Length") || 0;
+  if (!resp.body || !total) {
+    setStatus(`Downloading ${label}…`);
+    return resp.text();
+  }
+  const reader = resp.body.getReader();
+  const chunks = [];
+  let got = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    got += value.length;
+    setStatus(`Downloading ${label}… ${(got / 1048576).toFixed(1)} MB`);
+    setProgress(got / total);
+  }
+  setProgress(null);
+  const buf = new Uint8Array(got);
+  let off = 0;
+  for (const c of chunks) { buf.set(c, off); off += c.length; }
+  return new TextDecoder().decode(buf);
+}
+
 $("sample-btn").addEventListener("click", async () => {
-  setStatus("Loading sample…");
   try {
-    const resp = await fetch("data/sample.csv");
-    if (!resp.ok) throw new Error(`sample.csv: HTTP ${resp.status}`);
-    render(await resp.text(), "sample.csv");
+    const text = await downloadWithProgress("data/sample.csv", "sample data");
+    render(text, "sample.csv");
   } catch (err) {
+    setProgress(null);
     setStatus(`Error: ${err.message}`, true);
   }
 });

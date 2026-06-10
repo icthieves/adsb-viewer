@@ -11,7 +11,10 @@
 <header id="topbar">
   <div id="brand">
     <h1>ADS-B 3D Trajectory Viewer</h1>
-    <span id="status">Drop a dump1090 CSV anywhere, or choose a file.</span>
+    <div id="status-row">
+      <span id="status">Drop a dump1090 CSV anywhere, or choose a file.</span>
+      <div id="progress"><div id="progress-fill"></div></div>
+    </div>
   </div>
   <div id="controls">
     <label class="btn" for="file-input">Open CSV&hellip;</label>

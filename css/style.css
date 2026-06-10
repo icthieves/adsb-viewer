@@ -31,8 +31,26 @@ body { display: flex; flex-direction: column; }
 }
 
 #brand h1 { margin: 0; font-size: 16px; font-weight: 600; }
+#status-row { display: flex; align-items: center; gap: 10px; }
 #status { font-size: 12px; color: var(--fg-dim); }
 #status.error { color: #ff7b72; }
+
+#progress {
+  width: 140px;
+  height: 6px;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  background: #21262d;
+  overflow: hidden;
+  display: none;
+}
+#progress.active { display: block; }
+#progress-fill {
+  height: 100%;
+  width: 0;
+  background: var(--accent);
+  transition: width 0.15s linear;
+}
 
 #controls {
   display: flex;
