@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ADS-B 3D Trajectory Viewer</title>
+<link rel="stylesheet" href="css/style.css">
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+</head>
+<body>
+<header id="topbar">
+  <div id="brand">
+    <h1>ADS-B 3D Trajectory Viewer</h1>
+    <span id="status">Drop a dump1090 CSV anywhere, or choose a file.</span>
+  </div>
+  <div id="controls">
+    <label class="btn" for="file-input">Open CSV&hellip;</label>
+    <input type="file" id="file-input" accept=".csv,text/csv">
+    <button class="btn" id="sample-btn" type="button">Load sample</button>
+    <label class="toggle"><input type="checkbox" id="cb-callsigns" checked> Callsigns</label>
+    <label class="toggle"><input type="checkbox" id="cb-airports" checked> Airports</label>
+    <label class="toggle" id="vscale-wrap" title="Vertical exaggeration">
+      Vertical &times;<span id="vscale-val">0.35</span>
+      <input type="range" id="vscale" min="0.05" max="1" step="0.05" value="0.35">
+    </label>
+  </div>
+</header>
+<main id="plot-wrap">
+  <div id="plot"></div>
+  <div id="empty-hint">
+    <p><strong>No data loaded</strong></p>
+    <p>Drop a dump1090 ADS-B CSV file anywhere on this page.</p>
+    <p class="dim">Expected columns: hex_ident, altitude, latitude, longitude, date, time, callsign &mdash;
+       extra columns are ignored.</p>
+  </div>
+</main>
+<div id="drop-overlay"><span>Drop CSV to render</span></div>
+<script src="js/app.js"></script>
+</body>
+</html>
