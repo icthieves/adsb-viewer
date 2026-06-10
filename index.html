@@ -20,6 +20,7 @@
     <label class="btn" for="file-input">Open CSV&hellip;</label>
     <input type="file" id="file-input" accept=".csv,text/csv">
     <button class="btn" id="sample-btn" type="button">Load sample</button>
+    <button class="btn" id="panel-btn" type="button" hidden>Aircraft</button>
     <label class="toggle"><input type="checkbox" id="cb-callsigns" checked> Callsigns</label>
     <label class="toggle"><input type="checkbox" id="cb-airports" checked> Airports</label>
     <label class="toggle" id="vscale-wrap" title="Vertical exaggeration of terrain and altitudes">
@@ -30,6 +31,17 @@
 </header>
 <main id="plot-wrap">
   <div id="deck-wrap"></div>
+  <aside id="aircraft-panel" hidden>
+    <div id="panel-head">
+      <input type="text" id="panel-filter" placeholder="Filter callsign / hex&hellip;" autocomplete="off" spellcheck="false">
+      <div id="panel-actions">
+        <button class="btn small" id="panel-select-matches" type="button">Select matches</button>
+        <button class="btn small" id="panel-clear" type="button" disabled>Clear</button>
+      </div>
+      <label class="toggle"><input type="checkbox" id="cb-hide-others"> Hide others</label>
+    </div>
+    <div id="panel-list"></div>
+  </aside>
   <div id="empty-hint">
     <p><strong>No data loaded</strong></p>
     <p>Drop a dump1090 ADS-B CSV file anywhere on this page.</p>

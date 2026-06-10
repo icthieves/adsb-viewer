@@ -71,6 +71,8 @@ body { display: flex; flex-direction: column; }
   cursor: pointer;
 }
 .btn:hover { border-color: var(--fg-dim); }
+.btn:disabled { opacity: 0.5; cursor: default; }
+.btn.small { font-size: 11px; padding: 3px 8px; }
 
 .toggle {
   display: flex;
@@ -97,6 +99,57 @@ body { display: flex; flex-direction: column; }
 
 #plot-wrap { position: relative; flex: 1; min-height: 0; }
 #deck-wrap { position: absolute; inset: 0; }
+
+#aircraft-panel {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  bottom: 26px;
+  width: 250px;
+  display: flex;
+  flex-direction: column;
+  background: rgba(22, 27, 34, 0.92);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  z-index: 10;
+}
+#aircraft-panel[hidden] { display: none; }
+
+#panel-head {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 9px;
+  border-bottom: 1px solid var(--border);
+}
+#panel-filter {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--fg);
+  font-size: 12px;
+  padding: 5px 8px;
+}
+#panel-filter:focus { outline: none; border-color: var(--accent); }
+#panel-actions { display: flex; align-items: center; gap: 8px; }
+
+#panel-list { flex: 1; overflow-y: auto; padding: 4px 0; }
+.ac-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 3px 10px;
+  font-size: 12px;
+  color: var(--fg-dim);
+  cursor: pointer;
+  user-select: none;
+}
+.ac-row:hover { background: #21262d; }
+.ac-row.sel { color: var(--fg); background: rgba(88, 166, 255, 0.12); }
+.ac-row .check { width: 12px; flex: none; color: var(--accent); font-size: 11px; }
+.ac-row .swatch { width: 10px; height: 10px; border-radius: 2px; flex: none; }
+.ac-row .cs { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ac-row .n { font-size: 10px; color: var(--fg-dim); }
 
 #attribution {
   position: absolute;

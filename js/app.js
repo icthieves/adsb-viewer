@@ -26,6 +26,9 @@ let deckgl = null;       // created lazily on first render
 let airportsDb = null;   // lazily fetched data/airports.json
 let scene = null;        // { segments, lastPoints, airports, counts } for the loaded CSV
 
+const selectedHexes = new Set();  // aircraft isolated by panel or scene clicks
+let selectionVersion = 0;         // bumped per change, keys deck updateTriggers
+
 function setStatus(msg, isError = false) {
   statusEl.textContent = msg;
   statusEl.classList.toggle("error", isError);
@@ -132,12 +135,12 @@ function buildScene(aircraft) {
   for (const [hex, rec] of sorted) {
     rec.points.sort((a, b) => a.t - b.t);
     const label = rec.callsign || hex;
+    const color = PALETTE[colorIdx++ % PALETTE.length];
     const lastPt = rec.points[rec.points.length - 1];
     lastPoints.push({ lon: lastPt.lon, lat: lastPt.lat, alt: lastPt.alt,
-                      t: lastPt.t, label, hex });
+                      t: lastPt.t, label, hex, color, count: rec.points.length });
     if (rec.points.length < 2) continue;
     total += rec.points.length;
-    const color = PALETTE[colorIdx++ % PALETTE.length];
     let cur = null;
     let prevT = null;
     for (const p of rec.points) {
@@ -193,6 +196,19 @@ function vScale() { return parseFloat($("vscale").value); }
 function makeLayers() {
   if (!scene) return [];
   const f = vScale();
+  const selActive = selectedHexes.size > 0;
+  const hideOthers = $("cb-hide-others").checked;
+  const pathLayer = (id, data, { alpha, minPx, maxPx }) => new deck.PathLayer({
+    id,
+    data,
+    getPath: d => d.path.map(p => [p[0], p[1], p[2] * f]),
+    getColor: d => [d.color[0], d.color[1], d.color[2], alpha],
+    widthMinPixels: minPx,
+    widthMaxPixels: maxPx,
+    pickable: true,
+    updateTriggers: { getPath: f, getColor: selectionVersion },
+  });
+
   const layers = [
     new deck.TerrainLayer({
       id: "terrain",
@@ -205,18 +221,20 @@ function makeLayers() {
       strategy: "no-overlap",
       updateTriggers: { elevationDecoder: f },
     }),
-    new deck.PathLayer({
-      id: "paths",
-      data: scene.segments,
-      getPath: d => d.path.map(p => [p[0], p[1], p[2] * f]),
-      getColor: d => d.color,
-      widthMinPixels: 2,
-      widthMaxPixels: 4,
-      opacity: 0.85,
-      pickable: true,
-      updateTriggers: { getPath: f },
-    }),
   ];
+  if (!selActive) {
+    layers.push(pathLayer("paths", scene.segments, { alpha: 217, minPx: 2, maxPx: 4 }));
+  } else {
+    // dimmed context first, selected aircraft drawn on top
+    if (!hideOthers) {
+      layers.push(pathLayer("paths-dim",
+        scene.segments.filter(s => !selectedHexes.has(s.hex)),
+        { alpha: 34, minPx: 1.5, maxPx: 3 }));
+    }
+    layers.push(pathLayer("paths",
+      scene.segments.filter(s => selectedHexes.has(s.hex)),
+      { alpha: 255, minPx: 3.5, maxPx: 6 }));
+  }
   if ($("cb-airports").checked && scene.airports.length) {
     layers.push(
       new deck.ScatterplotLayer({
@@ -249,7 +267,8 @@ function makeLayers() {
   if ($("cb-callsigns").checked) {
     layers.push(new deck.TextLayer({
       id: "callsigns",
-      data: scene.lastPoints,
+      data: selActive ? scene.lastPoints.filter(p => selectedHexes.has(p.hex))
+                      : scene.lastPoints,
       getPosition: p => [p.lon, p.lat, p.alt * f],
       getText: p => p.label,
       getSize: 11,
@@ -279,7 +298,7 @@ const TOOLTIP_STYLE = {
 function getTooltip({ object, layer }) {
   if (!object) return null;
   let html = "";
-  if (layer.id === "paths") {
+  if (layer.id === "paths" || layer.id === "paths-dim") {
     html = `<b>${object.label}</b> (${object.hex})<br>` +
            `${fmtTime(object.t0)}–${fmtTime(object.t1)} UTC<br>` +
            `alt ${Math.round(object.altMin)}–${Math.round(object.altMax)} m`;
@@ -309,6 +328,104 @@ function fitViewState(bbox) {
   return { longitude, latitude, zoom, pitch: 55, bearing: -20,
            maxPitch: 85, minZoom: 3, maxZoom: 16 };
 }
+
+/* ---------------- Selection & aircraft panel ---------------- */
+
+function bumpSelection() {
+  selectionVersion++;
+  updateLayers();
+  refreshPanelRows();
+  $("panel-clear").disabled = selectedHexes.size === 0;
+  $("panel-clear").textContent = selectedHexes.size ? `Clear (${selectedHexes.size})` : "Clear";
+}
+
+function toggleHex(hex) {
+  if (selectedHexes.has(hex)) selectedHexes.delete(hex);
+  else selectedHexes.add(hex);
+  bumpSelection();
+}
+
+function clearSelection() {
+  if (!selectedHexes.size) return;
+  selectedHexes.clear();
+  bumpSelection();
+}
+
+function handleSceneClick(info) {
+  if (!info || !info.object || !info.layer) { clearSelection(); return; }
+  const id = info.layer.id;
+  if (id === "paths" || id === "paths-dim" || id === "callsigns") toggleHex(info.object.hex);
+  // clicks on airport layers neither select nor clear
+}
+
+function filteredRoster() {
+  const q = $("panel-filter").value.trim().toLowerCase();
+  const roster = scene ? scene.lastPoints : [];
+  if (!q) return roster;
+  return roster.filter(r => r.label.toLowerCase().includes(q) ||
+                            r.hex.toLowerCase().includes(q));
+}
+
+function renderPanelList() {
+  const list = $("panel-list");
+  list.textContent = "";
+  const frag = document.createDocumentFragment();
+  for (const r of filteredRoster()) {
+    const row = document.createElement("div");
+    row.className = "ac-row" + (selectedHexes.has(r.hex) ? " sel" : "");
+    row.dataset.hex = r.hex;
+    const check = document.createElement("span");
+    check.className = "check";
+    check.textContent = selectedHexes.has(r.hex) ? "✓" : "";
+    const swatch = document.createElement("span");
+    swatch.className = "swatch";
+    swatch.style.background = `rgb(${r.color[0]},${r.color[1]},${r.color[2]})`;
+    const cs = document.createElement("span");
+    cs.className = "cs";
+    cs.textContent = r.label;
+    cs.title = `${r.label} (${r.hex})`;
+    const n = document.createElement("span");
+    n.className = "n";
+    n.textContent = r.count;
+    row.append(check, swatch, cs, n);
+    frag.appendChild(row);
+  }
+  list.appendChild(frag);
+}
+
+function refreshPanelRows() {
+  for (const row of $("panel-list").children) {
+    const on = selectedHexes.has(row.dataset.hex);
+    row.classList.toggle("sel", on);
+    row.firstChild.textContent = on ? "✓" : "";
+  }
+}
+
+function buildPanel() {
+  const btn = $("panel-btn");
+  btn.hidden = false;
+  btn.textContent = `Aircraft (${scene.lastPoints.length})`;
+  $("panel-filter").value = "";
+  $("panel-clear").disabled = true;
+  $("panel-clear").textContent = "Clear";
+  renderPanelList();
+}
+
+$("panel-btn").addEventListener("click", () => {
+  const panel = $("aircraft-panel");
+  panel.hidden = !panel.hidden;
+});
+$("panel-filter").addEventListener("input", renderPanelList);
+$("panel-list").addEventListener("click", e => {
+  const row = e.target.closest(".ac-row");
+  if (row) toggleHex(row.dataset.hex);
+});
+$("panel-select-matches").addEventListener("click", () => {
+  for (const r of filteredRoster()) selectedHexes.add(r.hex);
+  bumpSelection();
+});
+$("panel-clear").addEventListener("click", clearSelection);
+$("cb-hide-others").addEventListener("change", updateLayers);
 
 /* ---------------- Render pipeline ---------------- */
 
@@ -343,10 +460,16 @@ async function render(text, sourceName) {
         initialViewState: fitViewState(bbox),
         layers: [],
         getTooltip,
+        onClick: handleSceneClick,
+        getCursor: ({ isHovering, isDragging }) =>
+          isDragging ? "grabbing" : (isHovering ? "pointer" : "grab"),
       });
     } else {
       deckgl.setProps({ initialViewState: fitViewState(bbox) });
     }
+    selectedHexes.clear();          // hex ids belong to the previous dataset
+    selectionVersion++;
+    buildPanel();
     updateLayers();
 
     const days = new Set(lastPoints.map(p => new Date(p.t).toISOString().slice(0, 10)));

@@ -7,16 +7,20 @@ labeled.
 **Live demo:** <https://icthieves.github.io/adsb-viewer/> — click **Load sample**
 for a day of Vancouver-area traffic.
 
-> **This branch (`deckgl`)** replaces the Plotly render layer with
-> [deck.gl](https://deck.gl): terrain streams with camera-based level of detail
-> via `TerrainLayer` (up to zoom 14, ~30 m source resolution) draped with Esri
-> World Imagery, and trajectories/labels are GPU layers. Compared with `main`
-> there is no per-aircraft legend, and altitudes render at true scale (the
-> Vertical slider exaggerates terrain and flight paths together).
+> Rendering is built on [deck.gl](https://deck.gl): terrain streams with
+> camera-based level of detail via `TerrainLayer` (up to zoom 14, ~30 m source
+> resolution) draped with Esri World Imagery, and trajectories/labels are GPU
+> layers. Altitudes render at true scale (the Vertical slider exaggerates
+> terrain and flight paths together).
 
 - **Trajectories** — one colored `PathLayer` line per aircraft; hover any line for
   callsign, hex, time span, and altitude range. Lines break across signal gaps
   longer than 10 minutes.
+- **Selection** — click a path or callsign label to isolate that aircraft (click
+  again to deselect, click empty terrain to clear). The **Aircraft** panel lists
+  every aircraft with a filter box — click rows to toggle, **Select matches** to
+  grab a whole fleet (e.g. filter `ACA`), and **Hide others** to remove instead
+  of dim the rest. Callsign labels follow the selection while one is active.
 - **Terrain** — elevation streamed live from the
   [AWS Terrain Tiles](https://registry.opendata.aws/terrain-tiles/) open dataset
   (terrarium PNG encoding) with level of detail that follows the camera — zoom in
@@ -27,7 +31,8 @@ for a day of Vancouver-area traffic.
 - **Callsign labels** — each aircraft's most recent position is labeled with its
   callsign (falling back to the hex ID if no callsign was broadcast).
 - **Controls** — checkboxes toggle the airport and callsign labels; the slider sets
-  vertical exaggeration (×1 is true scale).
+  vertical exaggeration (×1 is true scale); the **Aircraft** button opens the
+  selection panel.
 
 ## Running
 
