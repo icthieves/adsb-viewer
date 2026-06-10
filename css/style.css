@@ -96,7 +96,20 @@ body { display: flex; flex-direction: column; }
 #vscale-val { color: var(--fg); min-width: 28px; }
 
 #plot-wrap { position: relative; flex: 1; min-height: 0; }
-#plot { position: absolute; inset: 0; }
+#deck-wrap { position: absolute; inset: 0; }
+
+#attribution {
+  position: absolute;
+  right: 6px;
+  bottom: 4px;
+  font-size: 10px;
+  color: var(--fg-dim);
+  background: rgba(13, 17, 23, 0.55);
+  padding: 2px 6px;
+  border-radius: 4px;
+  pointer-events: none;
+  z-index: 5;
+}
 
 #empty-hint {
   position: absolute;

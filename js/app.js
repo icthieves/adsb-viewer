@@ -1,37 +1,30 @@
-/* ADS-B 3D Trajectory Viewer
- * Parses dump1090 CSV logs, renders trajectories with Plotly, drapes a terrain
- * surface (AWS Terrain Tiles, terrarium encoding) under the flight paths, and
- * labels airports (OurAirports dataset) plus each aircraft's latest position.
+/* ADS-B 3D Trajectory Viewer — deck.gl edition
+ * Parses dump1090 CSV logs and renders trajectories as PathLayers above a
+ * deck.gl TerrainLayer that streams Mapzen terrarium elevation tiles with
+ * camera-based level of detail, draped with Esri World Imagery. Airports
+ * (OurAirports dataset) and each aircraft's latest position are labeled.
  */
 "use strict";
 
-const TILE_URL = "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png";
-const TILE_TIMEOUT_MS = 12000;         // abort a stalled tile request after this long
-const TILE_RETRIES = 2;                // extra attempts per tile before giving up
-const GAP_BREAK_MS = 10 * 60 * 1000;   // break trajectory lines across signal gaps
-// Terrain detail presets: tile download budget and post-downsample grid width.
-// Each step up in budget admits roughly one extra zoom level (4x the tiles).
-const TERRAIN_DETAIL = {
-  low:    { maxTiles: 12,  gridW: 160 },
-  medium: { maxTiles: 30,  gridW: 250 },
-  high:   { maxTiles: 120, gridW: 500 },
-};
+const TERRAIN_TILES = "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png";
+const IMAGERY_TILES = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}";
+const GAP_BREAK_MS = 10 * 60 * 1000;   // break trajectory paths across signal gaps
 const BBOX_MARGIN = 0.08;              // fraction of span added around trajectories
 const MIN_SPAN_DEG = 0.4;              // minimum bbox span so tiny datasets still get context
-const WATER_SENTINEL = -500;           // surfacecolor value for sea cells (wide colorscale band)
-const CMAX_FLOOR = 1500;               // minimum colorscale top (m) so lowlands don't all turn white
 
-const PALETTE = ["#58a6ff", "#f78166", "#56d364", "#e3b341", "#bc8cff", "#39c5cf",
-                 "#ff7b72", "#7ee787", "#ffa657", "#d2a8ff", "#79c0ff", "#ffbedd",
-                 "#9ecbff", "#f0883e", "#6fdd8b", "#fbd669", "#cba6f7", "#76e3ea"];
+const PALETTE = [
+  [88, 166, 255], [247, 129, 102], [86, 211, 100], [227, 179, 65], [188, 140, 255],
+  [57, 197, 207], [255, 123, 114], [126, 231, 135], [255, 166, 87], [210, 168, 255],
+  [121, 192, 255], [255, 190, 221], [158, 203, 255], [240, 136, 62], [111, 221, 139],
+  [251, 214, 105], [203, 166, 247], [118, 227, 234],
+];
 
 const $ = id => document.getElementById(id);
 const statusEl = $("status");
-const plotEl = $("plot");
 
-let airportsDb = null;        // lazily fetched data/airports.json
-let traceIndex = {};          // {airports: i, labels: i} for checkbox toggles
-let zAspectMax = 1;           // horizontal aspect max, for the vertical-scale slider
+let deckgl = null;       // created lazily on first render
+let airportsDb = null;   // lazily fetched data/airports.json
+let scene = null;        // { segments, lastPoints, airports, counts } for the loaded CSV
 
 function setStatus(msg, isError = false) {
   statusEl.textContent = msg;
@@ -125,180 +118,61 @@ function parseCSV(text) {
   return { aircraft, bad };
 }
 
-/* ---------------- Trajectory traces ---------------- */
+/* ---------------- Scene data ---------------- */
 
 const fmtTime = t => new Date(t).toISOString().slice(11, 19);
 
-function buildTrajectories(aircraft) {
-  const traces = [];
-  const last = [];   // most recent point per aircraft, for callsign labels
+// Per-aircraft gap-split path segments plus the latest point for labeling
+function buildScene(aircraft) {
+  const segments = [];
+  const lastPoints = [];
   let total = 0;
+  let colorIdx = 0;
   const sorted = [...aircraft.entries()].sort((a, b) => b[1].points.length - a[1].points.length);
   for (const [hex, rec] of sorted) {
     rec.points.sort((a, b) => a.t - b.t);
     const label = rec.callsign || hex;
-    const p = rec.points[rec.points.length - 1];
-    last.push({ ...p, label, hex });
+    const lastPt = rec.points[rec.points.length - 1];
+    lastPoints.push({ lon: lastPt.lon, lat: lastPt.lat, alt: lastPt.alt,
+                      t: lastPt.t, label, hex });
     if (rec.points.length < 2) continue;
     total += rec.points.length;
-    const x = [], y = [], z = [], text = [];
-    let prev = null;
-    for (const pt of rec.points) {
-      if (prev !== null && pt.t - prev > GAP_BREAK_MS) {
-        x.push(null); y.push(null); z.push(null); text.push("");
+    const color = PALETTE[colorIdx++ % PALETTE.length];
+    let cur = null;
+    let prevT = null;
+    for (const p of rec.points) {
+      if (cur === null || p.t - prevT > GAP_BREAK_MS) {
+        cur = { path: [], color, label, hex,
+                t0: p.t, t1: p.t, altMin: p.alt, altMax: p.alt };
+        segments.push(cur);
       }
-      x.push(pt.lon); y.push(pt.lat); z.push(pt.alt);
-      const spd = pt.spd !== null ? `${Math.round(pt.spd)} km/h` : "n/a";
-      text.push(`${label} (${hex})<br>alt ${Math.round(pt.alt)} m | ${spd}<br>${fmtTime(pt.t)} UTC`);
-      prev = pt.t;
+      cur.path.push([p.lon, p.lat, p.alt]);
+      cur.t1 = p.t;
+      if (p.alt < cur.altMin) cur.altMin = p.alt;
+      if (p.alt > cur.altMax) cur.altMax = p.alt;
+      prevT = p.t;
     }
-    traces.push({
-      type: "scatter3d", mode: "lines", name: label,
-      x, y, z, text, hoverinfo: "text",
-      line: { color: PALETTE[traces.length % PALETTE.length], width: 3 },
-      opacity: 0.85,
-    });
   }
-  return { traces, last, total };
+  return { segments: segments.filter(s => s.path.length >= 2), lastPoints, total,
+           plotted: new Set(segments.map(s => s.hex)).size };
 }
 
-/* ---------------- Terrain (terrarium tiles) ---------------- */
-
-const lonToPx = (lon, z) => (lon + 180) / 360 * 256 * 2 ** z;
-const latToPx = (lat, z) => {
-  const r = lat * Math.PI / 180;
-  return (1 - Math.asinh(Math.tan(r)) / Math.PI) / 2 * 256 * 2 ** z;
-};
-const pxToLat = (y, z) => {
-  const n = Math.PI * (1 - 2 * y / (256 * 2 ** z));
-  return Math.atan(Math.sinh(n)) * 180 / Math.PI;
-};
-
-function pickZoom(bbox, maxTiles) {
-  for (let z = 12; z >= 3; z--) {
-    const tx = Math.floor(lonToPx(bbox.lonMax, z) / 256) - Math.floor(lonToPx(bbox.lonMin, z) / 256) + 1;
-    const ty = Math.floor(latToPx(bbox.latMin, z) / 256) - Math.floor(latToPx(bbox.latMax, z) / 256) + 1;
-    if (tx * ty <= maxTiles) return z;
-  }
-  return 3;
-}
-
-// fetch + AbortController so a stalled request can't hang the render forever
-// (an Image() src load has no timeout and may never fire onload OR onerror)
-async function loadTile(z, x, y, attempt = 0) {
-  const url = TILE_URL.replace("{z}", z).replace("{x}", x).replace("{y}", y);
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), TILE_TIMEOUT_MS);
-  try {
-    const resp = await fetch(url, { mode: "cors", signal: ctrl.signal });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    return await createImageBitmap(await resp.blob());
-  } catch (err) {
-    if (attempt < TILE_RETRIES) return loadTile(z, x, y, attempt + 1);
-    const why = err.name === "AbortError" ? "timed out" : err.message;
-    throw new Error(`tile ${z}/${x}/${y} ${why}`);
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-async function fetchTerrain(bbox, detail, onProgress) {
-  const z = pickZoom(bbox, detail.maxTiles);
-  const x0 = Math.floor(lonToPx(bbox.lonMin, z) / 256);
-  const x1 = Math.floor(lonToPx(bbox.lonMax, z) / 256);
-  const y0 = Math.floor(latToPx(bbox.latMax, z) / 256);
-  const y1 = Math.floor(latToPx(bbox.latMin, z) / 256);
-  const tilesX = x1 - x0 + 1, tilesY = y1 - y0 + 1;
-
-  const canvas = document.createElement("canvas");
-  canvas.width = tilesX * 256;
-  canvas.height = tilesY * 256;
-  const ctx = canvas.getContext("2d", { willReadFrequently: true });
-
-  const jobs = [];
-  for (let ty = y0; ty <= y1; ty++)
-    for (let tx = x0; tx <= x1; tx++) jobs.push({ tx, ty });
-  let done = 0;
-  const workers = Array.from({ length: 6 }, async () => {
-    while (jobs.length) {
-      const { tx, ty } = jobs.pop();
-      const img = await loadTile(z, tx, ty);
-      ctx.drawImage(img, (tx - x0) * 256, (ty - y0) * 256);
-      onProgress(++done, tilesX * tilesY);
+function dataBbox(aircraft) {
+  let latMin = 90, latMax = -90, lonMin = 180, lonMax = -180;
+  for (const rec of aircraft.values()) {
+    for (const p of rec.points) {
+      if (p.lat < latMin) latMin = p.lat;
+      if (p.lat > latMax) latMax = p.lat;
+      if (p.lon < lonMin) lonMin = p.lon;
+      if (p.lon > lonMax) lonMax = p.lon;
     }
-  });
-  await Promise.all(workers);
-
-  // Decode terrarium RGB -> elevation, cropped to the bbox
-  const pxL = Math.floor(lonToPx(bbox.lonMin, z) - x0 * 256);
-  const pxR = Math.floor(lonToPx(bbox.lonMax, z) - x0 * 256);
-  const pxT = Math.floor(latToPx(bbox.latMax, z) - y0 * 256);
-  const pxB = Math.floor(latToPx(bbox.latMin, z) - y0 * 256);
-  const w = pxR - pxL, h = pxB - pxT;
-  const rgba = ctx.getImageData(pxL, pxT, w, h).data;
-
-  const step = Math.max(1, Math.round(w / detail.gridW));
-  const gw = Math.floor(w / step), gh = Math.floor(h / step);
-  const zGrid = [], scGrid = [];
-  for (let gy = 0; gy < gh; gy++) {
-    const zRow = new Array(gw), scRow = new Array(gw);
-    for (let gx = 0; gx < gw; gx++) {
-      let sum = 0;
-      for (let dy = 0; dy < step; dy++) {
-        let i = ((gy * step + dy) * w + gx * step) * 4;
-        for (let dx = 0; dx < step; dx++, i += 4) {
-          sum += rgba[i] * 256 + rgba[i + 1] + rgba[i + 2] / 256 - 32768;
-        }
-      }
-      const elev = sum / (step * step);
-      zRow[gx] = elev > 0 ? Math.round(elev) : 0;
-      scRow[gx] = elev > 0 ? Math.round(elev) : WATER_SENTINEL;
-    }
-    zGrid.push(zRow); scGrid.push(scRow);
   }
-  const lons = Array.from({ length: gw },
-    (_, j) => bbox.lonMin + (bbox.lonMax - bbox.lonMin) * (j + 0.5) * step / w);
-  const lats = Array.from({ length: gh },
-    (_, i) => pxToLat(y0 * 256 + pxT + (i + 0.5) * step, z));
-  return { lons, lats, z: zGrid, sc: scGrid, zoom: z };
-}
-
-function terrainTrace(terrain) {
-  let zMax = 0;
-  for (const row of terrain.z) for (const v of row) if (v > zMax) zMax = v;
-  const cmax = Math.max(zMax, CMAX_FLOOR);
-  const pos = e => (e - WATER_SENTINEL) / (cmax - WATER_SENTINEL);
+  const dLat = Math.max((latMax - latMin) * BBOX_MARGIN, (MIN_SPAN_DEG - (latMax - latMin)) / 2, 0.02);
+  const dLon = Math.max((lonMax - lonMin) * BBOX_MARGIN, (MIN_SPAN_DEG - (lonMax - lonMin)) / 2, 0.02);
   return {
-    type: "surface",
-    x: terrain.lons, y: terrain.lats, z: terrain.z,
-    surfacecolor: terrain.sc,
-    cmin: WATER_SENTINEL, cmax,
-    colorscale: [
-      [0, "#2e7bbf"], [pos(-30), "#2e7bbf"],        // water band (sentinel cells)
-      [pos(0), "#33682f"],                           // shoreline lowlands
-      [pos(cmax * 0.13), "#578443"],
-      [pos(cmax * 0.30), "#96995a"],
-      [pos(cmax * 0.50), "#9c7e55"],
-      [pos(cmax * 0.70), "#8f8377"],
-      [pos(cmax * 0.87), "#c2bfba"],
-      [1, "#ffffff"],
-    ],
-    showscale: false, showlegend: false, name: "terrain",
-    hovertemplate: "terrain %{z:.0f} m<extra></extra>",
-    lighting: { ambient: 0.62, diffuse: 0.6, specular: 0.08, roughness: 0.85, fresnel: 0.2 },
-    lightposition: { x: -400, y: 600, z: 1500 },
+    latMin: Math.max(latMin - dLat, -85), latMax: Math.min(latMax + dLat, 85),
+    lonMin: Math.max(lonMin - dLon, -180), lonMax: Math.min(lonMax + dLon, 180),
   };
-}
-
-// Nearest-cell terrain height, so markers/labels sit on the surface
-function terrainHeightAt(terrain, lat, lon) {
-  if (!terrain) return 0;
-  const { lons, lats, z } = terrain;
-  let j = lons.findIndex(v => v >= lon);
-  if (j < 0) j = lons.length - 1;
-  let i = lats.findIndex(v => v <= lat);   // lats descend north -> south
-  if (i < 0) i = lats.length - 1;
-  return z[i][j];
 }
 
 /* ---------------- Airports ---------------- */
@@ -312,70 +186,131 @@ async function loadAirportsDb() {
   return airportsDb;
 }
 
-function airportsTrace(db, bbox, terrain) {
-  const within = db.filter(a => a.la >= bbox.latMin && a.la <= bbox.latMax &&
-                                a.lo >= bbox.lonMin && a.lo <= bbox.lonMax);
-  if (!within.length) return { trace: null, count: 0 };
-  const size = { large: 7, medium: 5, small: 4 };
-  return {
-    count: within.length,
-    trace: {
-      type: "scatter3d", mode: "markers+text", name: "Airports",
-      x: within.map(a => a.lo),
-      y: within.map(a => a.la),
-      z: within.map(a => Math.max(a.e, terrainHeightAt(terrain, a.la, a.lo)) + 30),
-      text: within.map(a => a.a || a.i),
-      hovertext: within.map(a => `${a.n} (${a.i}${a.a ? "/" + a.a : ""})<br>elev ${a.e} m`),
-      hoverinfo: "text",
-      textposition: "top center",
-      textfont: { color: "#ff8a8a", size: 11 },
-      marker: { color: "#ff5c5c", size: within.map(a => size[a.t]), symbol: "diamond" },
-      showlegend: false,
-    },
-  };
+/* ---------------- deck.gl layers ---------------- */
+
+function vScale() { return parseFloat($("vscale").value); }
+
+function makeLayers() {
+  if (!scene) return [];
+  const f = vScale();
+  const layers = [
+    new deck.TerrainLayer({
+      id: "terrain",
+      elevationData: TERRAIN_TILES,
+      texture: IMAGERY_TILES,
+      // terrarium decode is (R*256 + G + B/256) - 32768; scale it for exaggeration
+      elevationDecoder: { rScaler: 256 * f, gScaler: f, bScaler: f / 256, offset: -32768 * f },
+      minZoom: 0,
+      maxZoom: 14,
+      strategy: "no-overlap",
+      updateTriggers: { elevationDecoder: f },
+    }),
+    new deck.PathLayer({
+      id: "paths",
+      data: scene.segments,
+      getPath: d => d.path.map(p => [p[0], p[1], p[2] * f]),
+      getColor: d => d.color,
+      widthMinPixels: 2,
+      widthMaxPixels: 4,
+      opacity: 0.85,
+      pickable: true,
+      updateTriggers: { getPath: f },
+    }),
+  ];
+  if ($("cb-airports").checked && scene.airports.length) {
+    layers.push(
+      new deck.ScatterplotLayer({
+        id: "airport-dots",
+        data: scene.airports,
+        getPosition: a => [a.lo, a.la, (a.e || 0) * f + 40],
+        getFillColor: [255, 92, 92, 230],
+        radiusMinPixels: 4,
+        radiusMaxPixels: 7,
+        pickable: true,
+        updateTriggers: { getPosition: f },
+      }),
+      new deck.TextLayer({
+        id: "airport-codes",
+        data: scene.airports,
+        getPosition: a => [a.lo, a.la, (a.e || 0) * f + 40],
+        getText: a => a.a || a.i,
+        getSize: 12,
+        getColor: [255, 138, 138],
+        getPixelOffset: [0, -14],
+        characterSet: "auto",
+        fontFamily: "Segoe UI, sans-serif",
+        outlineWidth: 2,
+        outlineColor: [13, 17, 23, 220],
+        fontSettings: { sdf: true },
+        updateTriggers: { getPosition: f },
+      })
+    );
+  }
+  if ($("cb-callsigns").checked) {
+    layers.push(new deck.TextLayer({
+      id: "callsigns",
+      data: scene.lastPoints,
+      getPosition: p => [p.lon, p.lat, p.alt * f],
+      getText: p => p.label,
+      getSize: 11,
+      getColor: [230, 237, 243],
+      getPixelOffset: [0, -12],
+      characterSet: "auto",
+      fontFamily: "Segoe UI, sans-serif",
+      outlineWidth: 2,
+      outlineColor: [13, 17, 23, 220],
+      fontSettings: { sdf: true },
+      pickable: true,
+      updateTriggers: { getPosition: f },
+    }));
+  }
+  return layers;
 }
 
-/* ---------------- Callsign labels (latest position per aircraft) ---------------- */
+const TOOLTIP_STYLE = {
+  backgroundColor: "#161b22",
+  color: "#e6edf3",
+  fontSize: "12px",
+  border: "1px solid #30363d",
+  borderRadius: "6px",
+  padding: "6px 8px",
+};
 
-function labelsTrace(last) {
-  return {
-    type: "scatter3d", mode: "markers+text", name: "Callsigns",
-    x: last.map(p => p.lon),
-    y: last.map(p => p.lat),
-    z: last.map(p => p.alt),
-    text: last.map(p => p.label),
-    hovertext: last.map(p =>
-      `${p.label} (${p.hex})<br>last seen ${fmtTime(p.t)} UTC<br>alt ${Math.round(p.alt)} m`),
-    hoverinfo: "text",
-    textposition: "top center",
-    textfont: { color: "#e6edf3", size: 10 },
-    marker: { color: "#e6edf3", size: 2 },
-    showlegend: false,
-  };
+function getTooltip({ object, layer }) {
+  if (!object) return null;
+  let html = "";
+  if (layer.id === "paths") {
+    html = `<b>${object.label}</b> (${object.hex})<br>` +
+           `${fmtTime(object.t0)}–${fmtTime(object.t1)} UTC<br>` +
+           `alt ${Math.round(object.altMin)}–${Math.round(object.altMax)} m`;
+  } else if (layer.id.startsWith("airport")) {
+    html = `<b>${object.n}</b> (${object.i}${object.a ? "/" + object.a : ""})<br>elev ${object.e} m`;
+  } else if (layer.id === "callsigns") {
+    html = `<b>${object.label}</b> (${object.hex})<br>` +
+           `last seen ${fmtTime(object.t)} UTC<br>alt ${Math.round(object.alt)} m`;
+  } else {
+    return null;
+  }
+  return { html, style: TOOLTIP_STYLE };
+}
+
+function updateLayers() {
+  if (deckgl && scene) deckgl.setProps({ layers: makeLayers() });
+}
+
+function fitViewState(bbox) {
+  const wrap = $("deck-wrap");
+  const vp = new deck.WebMercatorViewport({
+    width: Math.max(wrap.clientWidth, 100),
+    height: Math.max(wrap.clientHeight, 100),
+  });
+  const { longitude, latitude, zoom } = vp.fitBounds(
+    [[bbox.lonMin, bbox.latMin], [bbox.lonMax, bbox.latMax]], { padding: 60 });
+  return { longitude, latitude, zoom, pitch: 55, bearing: -20,
+           maxPitch: 85, minZoom: 3, maxZoom: 16 };
 }
 
 /* ---------------- Render pipeline ---------------- */
-
-function dataBbox(aircraft) {
-  let latMin = 90, latMax = -90, lonMin = 180, lonMax = -180;
-  for (const rec of aircraft.values()) {
-    for (const p of rec.points) {
-      if (p.lat < latMin) latMin = p.lat;
-      if (p.lat > latMax) latMax = p.lat;
-      if (p.lon < lonMin) lonMin = p.lon;
-      if (p.lon > lonMax) lonMax = p.lon;
-    }
-  }
-  let dLat = Math.max((latMax - latMin) * BBOX_MARGIN, (MIN_SPAN_DEG - (latMax - latMin)) / 2, 0.02);
-  let dLon = Math.max((lonMax - lonMin) * BBOX_MARGIN, (MIN_SPAN_DEG - (lonMax - lonMin)) / 2, 0.02);
-  return {
-    latMin: Math.max(latMin - dLat, -85), latMax: Math.min(latMax + dLat, 85),
-    lonMin: Math.max(lonMin - dLon, -180), lonMax: Math.min(lonMax + dLon, 180),
-  };
-}
-
-let lastParsed = null;   // { aircraft, bad, sourceName } — detail changes re-render without re-parsing
-let renderSeq = 0;       // guards against a stale async render overwriting a newer one
 
 async function render(text, sourceName) {
   setStatus(`Processing ${sourceName}…`);
@@ -384,99 +319,47 @@ async function render(text, sourceName) {
   await paint();
   try {
     const { aircraft, bad } = parseCSV(text);
-    lastParsed = { aircraft, bad, sourceName };
-  } catch (err) {
-    console.error(err);
-    setStatus(`Error: ${err.message}`, true);
-    return;
-  }
-  await renderScene({ keepCamera: false });
-}
-
-async function renderScene({ keepCamera }) {
-  const { aircraft, bad, sourceName } = lastParsed;
-  const seq = ++renderSeq;
-  const stale = () => seq !== renderSeq;
-  try {
-    const { traces, last, total } = buildTrajectories(aircraft);
+    const { segments, lastPoints, total, plotted } = buildScene(aircraft);
     const bbox = dataBbox(aircraft);
-    setStatus(`Processed ${sourceName}: ${aircraft.size} aircraft, ${total.toLocaleString()} points — fetching terrain…`);
-    const detail = TERRAIN_DETAIL[$("terrain-detail").value] || TERRAIN_DETAIL.medium;
 
-    const [terrainRes, airportsRes] = await Promise.allSettled([
-      fetchTerrain(bbox, detail, (d, n) => {
-        if (stale()) return;
-        setStatus(`Fetching terrain tiles ${d}/${n}…`);
-        setProgress(d / n);
-      }),
-      loadAirportsDb(),
-    ]);
-    if (stale()) return;
-    setProgress(null);
-    const terrain = terrainRes.status === "fulfilled" ? terrainRes.value : null;
-    const warnings = [];
-    if (!terrain) warnings.push("terrain unavailable");
-
-    const all = [];
-    if (terrain) all.push(terrainTrace(terrain));
-    all.push(...traces);
-
-    traceIndex = {};
-    let airportCount = 0;
-    if (airportsRes.status === "fulfilled") {
-      const { trace, count } = airportsTrace(airportsRes.value, bbox, terrain);
-      if (trace) { traceIndex.airports = all.length; all.push(trace); airportCount = count; }
-    } else {
-      warnings.push("airport db unavailable");
+    setStatus("Loading airport database…");
+    let airports = [];
+    let airportsWarn = false;
+    try {
+      const db = await loadAirportsDb();
+      airports = db.filter(a => a.la >= bbox.latMin && a.la <= bbox.latMax &&
+                                a.lo >= bbox.lonMin && a.lo <= bbox.lonMax);
+    } catch (err) {
+      console.error(err);
+      airportsWarn = true;
     }
-    traceIndex.labels = all.length;
-    all.push(labelsTrace(last));
 
-    // Horizontal axes proportional in km; altitude exaggerated via slider factor
-    const latMid = (bbox.latMin + bbox.latMax) / 2;
-    const kmX = (bbox.lonMax - bbox.lonMin) * 111.32 * Math.cos(latMid * Math.PI / 180);
-    const kmY = (bbox.latMax - bbox.latMin) * 111.32;
-    const ay = kmY / kmX;
-    zAspectMax = Math.max(1, ay);
-    const vscale = parseFloat($("vscale").value);
+    scene = { segments, lastPoints, airports };
 
-    setStatus("Rendering 3D scene…");
-    await paint();
+    if (!deckgl) {
+      deckgl = new deck.DeckGL({
+        container: "deck-wrap",
+        controller: { inertia: 250 },
+        initialViewState: fitViewState(bbox),
+        layers: [],
+        getTooltip,
+      });
+    } else {
+      deckgl.setProps({ initialViewState: fitViewState(bbox) });
+    }
+    updateLayers();
 
-    const axis = (title, bg) => ({
-      title, color: "#8b949e", gridcolor: "#21262d",
-      zerolinecolor: "#30363d", backgroundcolor: bg,
-    });
-    await Plotly.newPlot(plotEl, all, {
-      paper_bgcolor: "#0d1117",
-      showlegend: true,
-      legend: { font: { color: "#8b949e", size: 9 }, bgcolor: "rgba(13,17,23,0.6)",
-                itemsizing: "constant" },
-      margin: { l: 0, r: 0, t: 0, b: 0 },
-      scene: {
-        aspectmode: "manual",
-        aspectratio: { x: 1, y: ay, z: vscale * zAspectMax },
-        xaxis: axis("Longitude", "#0d1117"),
-        yaxis: axis("Latitude", "#0d1117"),
-        zaxis: axis("Altitude (m)", "#161b22"),
-        camera: keepCamera && plotEl._fullLayout && plotEl._fullLayout.scene
-          ? JSON.parse(JSON.stringify(plotEl._fullLayout.scene.camera))
-          : { eye: { x: 1.4, y: -1.6, z: 0.8 } },
-      },
-    }, { responsive: true, displaylogo: false });
-    applyToggles();
-
-    const days = new Set(last.map(p => new Date(p.t).toISOString().slice(0, 10)));
+    const days = new Set(lastPoints.map(p => new Date(p.t).toISOString().slice(0, 10)));
     const parts = [
-      `${traces.length} aircraft`,
+      `${plotted} aircraft`,
       `${total.toLocaleString()} points`,
       [...days].sort().join(", ") + " UTC",
-      `${airportCount} airports`,
-      terrain ? `terrain z${terrain.zoom} (${terrain.lons.length}×${terrain.lats.length})` : null,
+      `${airports.length} airports`,
+      "terrain streams with the camera (LOD up to z14)",
       bad ? `${bad} rows skipped` : null,
-      warnings.length ? `⚠ ${warnings.join(", ")}` : null,
+      airportsWarn ? "⚠ airport db unavailable" : null,
     ].filter(Boolean);
-    setStatus(parts.join(" | "), warnings.length > 0);
+    setStatus(parts.join(" | "), airportsWarn);
   } catch (err) {
     console.error(err);
     setProgress(null);
@@ -485,29 +368,6 @@ async function renderScene({ keepCamera }) {
 }
 
 /* ---------------- UI wiring ---------------- */
-
-function applyToggles() {
-  if (!plotEl.data) return;
-  const updates = [];
-  if (traceIndex.airports !== undefined)
-    updates.push([traceIndex.airports, $("cb-airports").checked]);
-  if (traceIndex.labels !== undefined)
-    updates.push([traceIndex.labels, $("cb-callsigns").checked]);
-  for (const [idx, on] of updates)
-    Plotly.restyle(plotEl, { visible: on ? true : "legendonly" }, [idx]);
-}
-
-function loadFile(file) {
-  const reader = new FileReader();
-  reader.onload = () => render(reader.result, file.name);
-  reader.onerror = () => setStatus("Could not read file.", true);
-  reader.readAsText(file);
-}
-
-$("file-input").addEventListener("change", e => {
-  if (e.target.files[0]) loadFile(e.target.files[0]);
-  e.target.value = "";
-});
 
 // Streaming download so large files show byte progress. With gzip transfer the
 // Content-Length is the compressed size, so the fraction is clamped to 1.
@@ -537,6 +397,18 @@ async function downloadWithProgress(url, label) {
   return new TextDecoder().decode(buf);
 }
 
+function loadFile(file) {
+  const reader = new FileReader();
+  reader.onload = () => render(reader.result, file.name);
+  reader.onerror = () => setStatus("Could not read file.", true);
+  reader.readAsText(file);
+}
+
+$("file-input").addEventListener("change", e => {
+  if (e.target.files[0]) loadFile(e.target.files[0]);
+  e.target.value = "";
+});
+
 $("sample-btn").addEventListener("click", async () => {
   try {
     const text = await downloadWithProgress("data/sample.csv", "sample data");
@@ -547,18 +419,13 @@ $("sample-btn").addEventListener("click", async () => {
   }
 });
 
-$("cb-callsigns").addEventListener("change", applyToggles);
-$("cb-airports").addEventListener("change", applyToggles);
-
-$("terrain-detail").addEventListener("change", () => {
-  if (lastParsed) renderScene({ keepCamera: true });
-});
+$("cb-callsigns").addEventListener("change", updateLayers);
+$("cb-airports").addEventListener("change", updateLayers);
 
 $("vscale").addEventListener("input", () => {
-  const v = parseFloat($("vscale").value);
-  $("vscale-val").textContent = v.toFixed(2);
-  if (plotEl.data) Plotly.relayout(plotEl, { "scene.aspectratio.z": v * zAspectMax });
+  $("vscale-val").textContent = vScale().toFixed(2).replace(/\.?0+$/, "");
 });
+$("vscale").addEventListener("change", updateLayers);
 
 let dragDepth = 0;
 document.addEventListener("dragenter", e => {
